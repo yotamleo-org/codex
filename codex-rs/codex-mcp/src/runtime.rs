@@ -107,6 +107,20 @@ struct PublishedMcpRuntime {
     cached_binding: Mutex<Option<CachedMcpBinding>>,
 }
 
+impl PublishedMcpRuntime {
+    fn empty(prefix_mcp_tool_names: bool) -> Self {
+        Self {
+            connections: Arc::new(McpConnectionSet::empty(prefix_mcp_tool_names)),
+            config: None,
+            auth: None,
+            auth_token: None,
+            plugins_available: false,
+            ready_selected_capability_roots: Vec::new(),
+            cached_binding: Mutex::new(None),
+        }
+    }
+}
+
 struct CachedMcpBinding {
     catalog_revision: u64,
     binding: Arc<McpBinding>,
@@ -167,15 +181,7 @@ impl McpRuntime {
     /// runtime handle before its full MCP inputs are available.
     pub fn empty(prefix_mcp_tool_names: bool) -> Self {
         Self {
-            current: ArcSwap::from_pointee(PublishedMcpRuntime {
-                connections: Arc::new(McpConnectionSet::empty(prefix_mcp_tool_names)),
-                config: None,
-                auth: None,
-                auth_token: None,
-                plugins_available: false,
-                ready_selected_capability_roots: Vec::new(),
-                cached_binding: Mutex::new(None),
-            }),
+            current: ArcSwap::from_pointee(PublishedMcpRuntime::empty(prefix_mcp_tool_names)),
             hosted_event_server_removals: watch::channel(()).0,
             reconnect_pending: AtomicBool::new(false),
             elicitation_router: ElicitationRequestRouter::default(),
@@ -569,6 +575,26 @@ impl McpRuntime {
 
     pub async fn shutdown(&self) {
         self.latest_connections().shutdown().await;
+    }
+
+    /// Retires the published generation without disturbing calls already using it.
+    ///
+    /// New callers observe an empty runtime, while a call that already captured the
+    /// previous [`McpConnectionSet`] keeps it until the call returns — the same
+    /// lifetime a refresh grants a superseded generation. Its stdio children exit
+    /// once that last reference drops. Prefer this over [`Self::shutdown`] when the
+    /// owning thread outlives its servers, so a live thread stops holding processes
+    /// it no longer needs.
+    pub fn retire(&self) {
+        let prefix_mcp_tool_names = self
+            .current
+            .load()
+            .config
+            .as_ref()
+            .is_some_and(|config| config.prefix_mcp_tool_names);
+        self.current
+            .store(Arc::new(PublishedMcpRuntime::empty(prefix_mcp_tool_names)));
+        self.hosted_event_server_removals.send_replace(());
     }
 }
 

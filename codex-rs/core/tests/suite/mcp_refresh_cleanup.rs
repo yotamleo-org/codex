@@ -246,8 +246,116 @@ async fn completed_subagent_releases_its_stdio_mcp_servers() -> anyhow::Result<(
     // The thread is still loaded; only its MCP fleet should be gone.
     wait_for_process_exit(&subagent_pid).await?;
 
+    // The still-resident thread republishes a working fleet the next time it needs one.
+    fs::remove_file(&pid_file)?;
+    subagent
+        .call_mcp_tool(
+            LIFECYCLE_SERVER_NAME,
+            "sync",
+            Some(serde_json::json!({})),
+            /*meta*/ None,
+        )
+        .await?;
+    let resumed_pid = wait_for_pid_file(&pid_file).await?;
+    assert_ne!(resumed_pid, subagent_pid);
+
     subagent.shutdown_and_wait().await?;
-    fixture.codex.shutdown_and_wait().await
+    fixture.codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
+/// Releasing the fleet must not cut off a tool call that is still running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_subagent_keeps_in_flight_mcp_calls_alive() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let temp_dir = tempfile::tempdir()?;
+    let pid_file = temp_dir.path().join("in-flight-mcp.pid");
+    let fixture = test_codex().build(&server).await?;
+
+    let mut subagent_config = fixture.config.clone();
+    with_pid_reporting_stdio_server(&mut subagent_config, &pid_file)?;
+    let NewThread {
+        thread: subagent, ..
+    } = fixture
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            session_source: Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: fixture.session_configured.thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            ..StartThreadOptions::new(subagent_config)
+        })
+        .await?;
+    wait_for_mcp_server(&subagent, LIFECYCLE_SERVER_NAME).await?;
+    let subagent_pid = wait_for_pid_file(&pid_file).await?;
+
+    // The barrier rendezvous below proves the long call is running before the turn ends.
+    let barrier = serde_json::json!({
+        "id": "subagent-release-in-flight",
+        "participants": 2,
+        "timeout_ms": 1_000
+    });
+    let long_call = tokio::spawn({
+        let subagent = Arc::clone(&subagent);
+        let barrier = barrier.clone();
+        async move {
+            subagent
+                .call_mcp_tool(
+                    LIFECYCLE_SERVER_NAME,
+                    "sync",
+                    Some(serde_json::json!({
+                        "barrier": barrier,
+                        "sleep_after_ms": 300_000
+                    })),
+                    /*meta*/ None,
+                )
+                .await
+        }
+    });
+    subagent
+        .call_mcp_tool(
+            LIFECYCLE_SERVER_NAME,
+            "sync",
+            Some(serde_json::json!({ "barrier": barrier })),
+            /*meta*/ None,
+        )
+        .await?;
+
+    responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("in-flight-resp"),
+            responses::ev_assistant_message("in-flight-msg", "done"),
+            responses::ev_completed("in-flight-resp"),
+        ]),
+    )
+    .await;
+    subagent
+        .start_or_steer_turn(assistant_turn("finish while a tool call is running"))
+        .await?;
+    wait_for_event(&subagent, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    assert!(process_is_alive(&subagent_pid)?);
+    long_call.abort();
+    assert!(
+        long_call
+            .await
+            .expect_err("call should be aborted")
+            .is_cancelled()
+    );
+    wait_for_process_exit(&subagent_pid).await?;
+
+    subagent.shutdown_and_wait().await?;
+    fixture.codex.shutdown_and_wait().await?;
+    Ok(())
 }
 
 /// The release above is scoped to subagents: a root thread keeps its fleet between turns.

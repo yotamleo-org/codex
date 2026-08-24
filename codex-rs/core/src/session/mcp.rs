@@ -319,6 +319,9 @@ impl Session {
     /// MCP runtime. The next turn republishes through [`Self::refresh_mcp_if_dirty`],
     /// and subagent startup is lazy (`McpStartupPolicy::LazyWhenCached`), so a resumed
     /// subagent only pays for the servers it actually uses again.
+    ///
+    /// This retires the generation rather than shutting it down, so an out-of-band
+    /// tool call that is still running keeps the connections it captured.
     pub(crate) async fn release_idle_subagent_mcp_runtime(self: &Arc<Self>) {
         if !matches!(
             self.state.lock().await.session_configuration.session_source,
@@ -336,9 +339,7 @@ impl Session {
         {
             return;
         }
-        // Clients shut down below must not be reused by the next publish.
-        self.services.mcp_runtime.reconnect_on_next_refresh();
-        self.services.mcp_runtime.shutdown().await;
+        self.services.mcp_runtime.retire();
         self.mark_mcp_runtime_dirty();
     }
 
