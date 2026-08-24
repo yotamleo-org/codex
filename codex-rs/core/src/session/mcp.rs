@@ -306,6 +306,42 @@ impl Session {
         self.mcp_refresh.invalidate();
     }
 
+    /// Releases an idle subagent thread's MCP fleet while the thread stays resident.
+    ///
+    /// A MultiAgentV2 subagent stays loaded after its turn finishes so the parent can
+    /// still wait on it, resume it, or read its transcript. Its MCP runtime owns stdio
+    /// server processes, so keeping the thread resident also keeps a full duplicate
+    /// fleet alive; under a long-lived host those fleets accumulate one per completed
+    /// subagent.
+    ///
+    /// Residency and live OS processes are separable: dropping the fleet here leaves
+    /// history, resume, and transcript reads untouched, because none of them touch the
+    /// MCP runtime. The next turn republishes through [`Self::refresh_mcp_if_dirty`],
+    /// and subagent startup is lazy (`McpStartupPolicy::LazyWhenCached`), so a resumed
+    /// subagent only pays for the servers it actually uses again.
+    pub(crate) async fn release_idle_subagent_mcp_runtime(self: &Arc<Self>) {
+        if !matches!(
+            self.state.lock().await.session_configuration.session_source,
+            SessionSource::SubAgent(_)
+        ) {
+            return;
+        }
+        // Hold the refresh gate so this cannot race a publish already in flight.
+        let Ok(_refresh) = self.mcp_refresh.acquire().await else {
+            return;
+        };
+        // Re-check under the gate: a queued turn may have started while we waited.
+        if self.active_turn.lock().await.is_some()
+            || self.input_queue.has_pending_mailbox_items().await
+        {
+            return;
+        }
+        // Clients shut down below must not be reused by the next publish.
+        self.services.mcp_runtime.reconnect_on_next_refresh();
+        self.services.mcp_runtime.shutdown().await;
+        self.mark_mcp_runtime_dirty();
+    }
+
     #[tracing::instrument(name = "mcp.runtime.resolve_for_step", skip_all)]
     pub(crate) async fn mcp_runtime_for_step(
         self: &Arc<Self>,

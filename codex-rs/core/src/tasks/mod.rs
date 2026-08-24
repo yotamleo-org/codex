@@ -835,6 +835,8 @@ impl Session {
         }
         if cleared_active_turn {
             self.maybe_start_turn_for_pending_work().await;
+            // Runs after the line above so a queued turn keeps its fleet.
+            self.release_idle_subagent_mcp_runtime().await;
         }
     }
 
