@@ -4,11 +4,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use codex_config::Config;
 use codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::NewThread;
+use codex_core::config::Config;
 use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
 use codex_protocol::protocol::EventMsg;
