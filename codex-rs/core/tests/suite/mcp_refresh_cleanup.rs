@@ -388,11 +388,8 @@ async fn completed_root_turn_keeps_its_stdio_mcp_servers() -> anyhow::Result<()>
         ]),
     )
     .await;
+    // submit_turn returns once the turn is complete.
     fixture.submit_turn("finish without using tools").await?;
-    wait_for_event(&fixture.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
 
     assert!(process_is_alive(&root_pid)?);
 
